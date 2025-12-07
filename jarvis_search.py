@@ -798,7 +798,11 @@ async def main():
     else:
         # Тестовые запросы
         queries = [
-            "погода челябинск 08 декабря 2025 год",
+            "RAG новшества 2025 год",
+            "retrieval‑augmented generation тренды 2025",
+            "внедрение RAG в production 2025",
+            "сравнение LLM RAG и без RAG 2025",
+            "case study RAG 2025 успехи"
         ]
         print(f"📝 Using {len(queries)} test queries\n")
 
