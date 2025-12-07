@@ -1,0 +1,137 @@
+# searxng/settings.yml
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "Jarvis Search"
+  enable_metrics: false
+
+server:
+  secret_key: "${SEARXNG_SECRET}"
+  limiter: false  # Отключаем для localhost (включите для публичного доступа)
+  image_proxy: true
+  method: "GET"
+
+  # uWSGI optimization (если используете uwsgi.ini)
+  uwsgi:
+    workers: 8
+    threads: 4
+    buffer-size: 8192
+    http-timeout: 30
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  max_page: 3  # Ограничиваем глубину для скорости
+  formats:
+    - html
+    - json
+
+ui:
+  default_locale: "en"
+  theme_args:
+    simple_style: dark
+
+# ========== КРИТИЧНО: ENGINE CONFIGURATION ==========
+# Выбираем только надёжные движки с низким риском банов
+
+engines:
+  # === PRIMARY: DuckDuckGo (самый надёжный) ===
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    timeout: 3.0
+    disabled: false
+    weight: 2.0  # Высший приоритет
+
+  # === FALLBACK: Brave Search (без CAPTCHA) ===
+  - name: brave
+    engine: brave
+    shortcut: br
+    timeout: 3.0
+    disabled: false
+    weight: 1.5
+    # Brave не требует API ключа и редко банит
+
+  # === KNOWLEDGE BASE: Wikipedia ===
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    timeout: 2.0
+    disabled: false
+    weight: 1.3
+
+  # === FALLBACK: Qwant (европейский, меньше банов) ===
+  - name: qwant
+    engine: qwant
+    shortcut: qw
+    timeout: 3.0
+    disabled: false
+    weight: 1.2
+
+  # === ACADEMIC: arXiv (для научных запросов) ===
+  - name: arxiv
+    engine: arxiv
+    shortcut: arx
+    timeout: 4.0
+    disabled: false
+    categories: [science]
+    weight: 1.8
+
+  # === DEV TOOLS ===
+  - name: github
+    engine: github
+    shortcut: gh
+    timeout: 4.0
+    disabled: false
+    categories: [it]
+    weight: 1.4
+
+  - name: stackoverflow
+    engine: stackoverflow
+    shortcut: so
+    timeout: 4.0
+    disabled: false
+    categories: [it]
+    weight: 1.3
+
+  # === GOOGLE/BING: ТОЛЬКО ДЛЯ КРИТИЧНЫХ ЗАПРОСОВ ===
+  # Включайте их осторожно - высокий риск банов
+
+  - name: google
+    engine: google
+    shortcut: go
+    timeout: 3.0
+    disabled: true  # Отключаем по умолчанию!
+    weight: 1.0
+    # Раскомментируйте, если готовы к рискам:
+    # disabled: false
+
+  - name: bing
+    engine: bing
+    shortcut: bi
+    timeout: 3.0
+    disabled: true  # Отключаем по умолчанию!
+    weight: 0.8
+
+  # === ОТКЛЮЧАЕМ МЕДЛЕННЫЕ/ПРОБЛЕМНЫЕ ===
+  - name: reddit
+    disabled: true
+  - name: twitter
+    disabled: true
+  - name: wikidata
+    disabled: true
+
+# Limiter configuration (если включите server.limiter)
+limiter:
+  real_ip:
+    x_for: 1
+    ipv4_prefix: 32
+    ipv6_prefix: 56
+
+  botdetection:
+    ip_limit:
+      filter_link_local: true
+      link_token: true
+      # Для localhost не применяется
