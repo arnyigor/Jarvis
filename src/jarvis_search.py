@@ -52,7 +52,7 @@ class SearchConfig:
     base_url: str = "http://localhost:8080"
     timeout: int = 10
     max_retries: int = 3
-    cache_dir: Path = field(default_factory=lambda: Path(".cache/searxng"))
+    cache_dir: Path = field(default_factory=lambda: Path("../.cache/searxng"))
     cache_ttl: int = 3600  # 1 час
 
     # Rate limiting
