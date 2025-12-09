@@ -13,9 +13,11 @@ import re
 import shutil
 import sys
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from multiprocessing import Pool
+from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -23,11 +25,10 @@ import chromadb
 import torch
 import trafilatura
 from chromadb.config import Settings
-from docling.document_converter import DocumentConverter
+from docling.datamodel.base_models import InputFormat
 from scipy.sparse import csr_matrix
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from tqdm import tqdm
-from multiprocessing import Pool, cpu_count
 
 warnings = None  # silence future warnings – same behaviour as original
 
@@ -44,11 +45,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.datamodel.pipeline_options import (
+    PdfPipelineOptions,
+    TesseractOcrOptions,
+    EasyOcrOptions,
+    RapidOcrOptions  # Самый быстрый
+)
 
 # Пытаемся импортировать pymorphy3, но делаем это внутри функции инициализации,
 # чтобы не грузить его сразу при импорте модуля (хотя это не критично, pymorphy легкий)
 try:
     import pymorphy3
+
     PYMORPHY_AVAILABLE = True
 except ImportError:
     PYMORPHY_AVAILABLE = False
@@ -56,11 +65,13 @@ except ImportError:
 # Глобальная переменная для воркера
 _morph_analyzer = None
 
+
 def init_worker():
     """Эта функция вызывается один раз при старте каждого процесса"""
     global _morph_analyzer
     if PYMORPHY_AVAILABLE:
         _morph_analyzer = pymorphy3.MorphAnalyzer()
+
 
 def lemmatize_text_worker(text: str) -> str:
     """Функция, которая будет выполняться в отдельном процессе"""
@@ -70,7 +81,7 @@ def lemmatize_text_worker(text: str) -> str:
         if PYMORPHY_AVAILABLE:
             _morph_analyzer = pymorphy3.MorphAnalyzer()
         else:
-            return text # Возвращаем как есть
+            return text  # Возвращаем как есть
 
     # Логика лемматизации (копируем вашу)
     words = re.findall(r'\b\w+\b', text.lower())
@@ -225,6 +236,14 @@ class RussianLemmatizerFast:
 @dataclass
 class HybridConfig:
     static_docs_dir: Path
+
+    # OCR параметры
+    ocr_engine: str = "rapidocr"  # "tesseract" | "easyocr" | "rapidocr"
+    ocr_force_full_page: bool = False  # True = OCR всегда, False = авто
+    ocr_languages: List[str] = field(default_factory=lambda: ["ru", "en"])
+
+    # Performance
+    docling_use_gpu: bool = True  # Для layout models
 
     # Models
     embedding_model: str = "intfloat/multilingual-e5-small"
@@ -463,7 +482,7 @@ class BM25ANNIndex:
         С ПАРАЛЛЕЛЬНОЙ ЛЕММАТИЗАЦИЕЙ.
         """
         # 1️⃣ Собираем тексты и ids
-        raw_texts = [doc["text"] for doc in documents] # Исходные тексты
+        raw_texts = [doc["text"] for doc in documents]  # Исходные тексты
         self.corpus_ids = [doc["id"] for doc in documents]
 
         # 2️⃣ Лемматизация (Pre-processing)
@@ -502,8 +521,8 @@ class BM25ANNIndex:
 
         # Самый простой способ для пре-лемматизированного текста "word1 word2":
         self.vectorizer = TfidfVectorizer(
-            token_pattern=r"(?u)\b\w\w+\b", # Стандартный паттерн (слова от 2 букв)
-            lowercase=True # На всякий случай, хотя лемматизатор уже low
+            token_pattern=r"(?u)\b\w\w+\b",  # Стандартный паттерн (слова от 2 букв)
+            lowercase=True  # На всякий случай, хотя лемматизатор уже low
         )
 
         tfidf_matrix: csr_matrix = self.vectorizer.fit_transform(processed_texts)
@@ -525,9 +544,8 @@ class BM25ANNIndex:
         # Обертка, чтобы вызывать метод лемматизатора
         return self.lemmatizer.lemmatize(text)
 
-
     # ------------------------------------------------------------------
-    def search(self,  query: str, top_k: int = 10) -> List[Tuple[str, float]]:
+    def search(self, query: str, top_k: int = 10) -> List[Tuple[str, float]]:
         """
         Поиск по запросу с помощью FAISS и TF‑IDF.
         Возвращает список (doc_id, score), отсортированный по убыванию.
@@ -702,9 +720,17 @@ class HybridRAGSystem:
     # -------------------------------------------------------------------
     def index_static_documents(self, force: bool = False) -> int:
         """
-        Индексация с защитой от прерываний.
-        Все изменения коммитятся только в конце. При ошибке – откат.
+        Индексация статических документов с поддержкой пакетной обработки и
+        параллельного OCR‑парсинга PDF‑файлов (Docling). Весь процесс атомарен –
+        при любой ошибке данные откатываются.
+
+        Параметры
+        ----------
+        force : bool, default False
+            Принудительно пересобрать коллекцию/кэш. Если True – сбрасываем
+            существующий колле­кц‑ион в Chroma и чистим кэши.
         """
+        # ---------- 1. Проверка интервала переиндексации ----------
         if not force and self._last_index_time:
             elapsed = datetime.now() - self._last_index_time
             if elapsed < timedelta(days=self.config.reindex_interval_days):
@@ -713,6 +739,7 @@ class HybridRAGSystem:
                 )
                 return 0
 
+        # ---------- 2. Принудительная очистка ----------
         if force:
             logger.info("🗑️  Force reindex: clearing...")
             try:
@@ -726,125 +753,150 @@ class HybridRAGSystem:
             except Exception as e:
                 logger.error(f"Failed to clear: {e}")
 
-        logger.info(f"📚 Indexing from {self.config.static_docs_dir}")
+        # ---------- 3. Сбор списка файлов ----------
+        file_list = [
+            f for f in self.config.static_docs_dir.rglob("*")
+            if f.is_file() and f.suffix in {
+                ".md", ".txt", ".html", ".pdf",
+                ".png", ".jpg", ".jpeg", ".tiff"
+            }
+        ]
+        total_files = len(file_list)
+        logger.info(f"📚 Indexing from {self.config.static_docs_dir} ({total_files} files)")
 
-        documents: List[Dict] = []
-        doc_id_start = self.collection.count()
-        doc_id = doc_id_start
-
-        stats = {
-            "total_files": 0,
+        # ---------- 4. Инициализация статистики ----------
+        stats: Dict[str, int] = {
             "new_files": 0,
             "skipped": 0,
             "failed": 0,
             "chunks": 0,
         }
 
-        file_list = list(self.config.static_docs_dir.rglob("*"))
-        file_list = [
-            f
-            for f in file_list
-            if f.is_file() and f.suffix in {".md", ".txt", ".html", ".pdf"}
-        ]
+        # ---------- 5. Параллельный OCR‑парсинг PDF‑файлов ----------
+        pdf_paths: List[Path] = [p for p in file_list if p.suffix.lower() == ".pdf"]
+        other_paths: List[Path] = [p for p in file_list if p.suffix.lower() != ".pdf"]
 
-        stats["total_files"] = len(file_list)
+        pdf_contents: Dict[Path, str] = {}
+        if pdf_paths:
+            logger.info(f"🔄 Processing {len(pdf_paths)} PDFs (OCR enabled)...")
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                for path, content in zip(
+                        pdf_paths,
+                        executor.map(self._extract_pdf_docling, pdf_paths),
+                ):
+                    if content:
+                        pdf_contents[path] = content
 
-        if not file_list:
-            logger.warning("⚠️  No files found")
-            return 0
+        # ---------- 6. Пошаговая обработка (без PDF) ----------
+        documents: List[Dict] = []
+        doc_id_start = self.collection.count()
+        cur_id = doc_id_start
 
+        def _process_file(file_path: Path) -> None:
+            nonlocal cur_id
+            try:
+                progress.set_postfix({"file": file_path.name[:30]})
+                # 6.1 Hash‑контроль
+                file_hash = compute_file_hash(file_path)
+                if not file_hash:
+                    stats["failed"] += 1
+                    return
+
+                if not force and self.index_cache.is_indexed(
+                        file_path, file_hash):
+                    stats["skipped"] += 1
+                    return
+
+                # 6.2 Извлечение содержимого (PDF уже извлечён)
+                content = (
+                    pdf_contents.get(file_path) if file_path in pdf_paths else
+                    self._extract_html_or_text(file_path)
+                )
+                if not content or len(content) < self.config.min_chunk_length:
+                    stats["skipped"] += 1
+                    return
+
+                # 6.3 Чанкинг
+                chunks = self._chunk_text(content, file_path.name)
+                if not chunks:
+                    stats["skipped"] += 1
+                    return
+
+                for chunk in chunks:
+                    documents.append(
+                        {
+                            "id": str(cur_id),
+                            "text": chunk["text"],
+                            "source": str(file_path.relative_to(self.config.static_docs_dir)),
+                            "chunk_index": chunk["index"],
+                            "file_hash": file_hash,
+                            "metadata": {
+                                "source_type": "static",
+                                "indexed_at": datetime.now().isoformat(),
+                                "file_type": file_path.suffix.lower(),
+                                "file_hash": file_hash,
+                            },
+                        }
+                    )
+                    cur_id += 1
+
+                # 6.4 Кэшируем только после успешной генерации чанков
+                self.index_cache.mark_indexed(file_path, file_hash, len(chunks))
+                stats["new_files"] += 1
+                stats["chunks"] += len(chunks)
+
+            except Exception as exc:
+                stats["failed"] += 1
+                logger.error(f"Error processing {file_path.name}: {exc}")
+
+        # ---------- 7. tqdm‑постраничка ----------
         try:
             progress = tqdm(
-                file_list,
+                other_paths,
                 desc="Processing",
                 disable=not self.config.enable_progress_bars,
             )
+            for fp in progress:
+                _process_file(fp)
 
-            for file_path in progress:
-                try:
-                    progress.set_postfix({"file": file_path.name[:30]})
-                    file_hash = compute_file_hash(file_path)
-                    if not file_hash:
-                        stats["failed"] += 1
-                        continue
+        except KeyboardInterrupt:  # Ctrl+C → откат
+            logger.warning("⚠️  Indexing interrupted by user!")
+            logger.warning("🔄 Rolling back changes...")
+            self.index_cache.rollback()
+            raise
 
-                    if not force and self.index_cache.is_indexed(
-                            file_path, file_hash
-                    ):
-                        stats["skipped"] += 1
-                        continue
+        # ---------- 8. Сборка документов из PDF ----------
+        for pdf_path in pdf_paths:
+            _process_file(pdf_path)
 
-                    # extract content
-                    if file_path.suffix == ".pdf":
-                        content = self._extract_pdf_docling(file_path)
-                    else:
-                        content = self._extract_html_or_text(file_path)
+        if not documents:
+            logger.info("⚠️  No new documents")
+            return 0
 
-                    if not content or len(content) < self.config.min_chunk_length:
-                        stats["skipped"] += 1
-                        continue
+        # ---------- 9. Генерация эмбеддингов ----------
+        logger.info(f"🔄 Embedding {len(documents)} chunks...")
 
-                    chunks = self._chunk_text(content, file_path.name)
+        texts = [doc["text"] for doc in documents]
+        embeddings = self.embedding_model.encode(
+            texts,
+            batch_size=self.config.embedding_batch_size,
+            show_progress_bar=self.config.enable_progress_bars,
+            convert_to_numpy=True,
+            normalize_embeddings=self.config.normalize_embeddings,
+        )
 
-                    if not chunks:
-                        stats["skipped"] += 1
-                        continue
+        # ---------- 10. Добавление в Chroma ----------
+        logger.info("💾 Storing in ChromaDB...")
+        self._add_documents_in_batches(documents, embeddings)
 
-                    for chunk in chunks:
-                        documents.append(
-                            {
-                                "id": str(doc_id),
-                                "text": chunk["text"],
-                                "source": str(file_path.relative_to(self.config.static_docs_dir)),
-                                "chunk_index": chunk["index"],
-                                "file_hash": file_hash,
-                                "metadata": {
-                                    "source_type": "static",
-                                    "indexed_at": datetime.now().isoformat(),
-                                    "file_type": file_path.suffix,
-                                    "file_hash": file_hash,
-                                },
-                            }
-                        )
-                        doc_id += 1
+        # ---------- 11. Построение BM25 ----------
+        logger.info("🔄 Building BM25 index...")
+        self.bm25_index.build_index(documents)
 
-                    # mark in cache (but not commit yet)
-                    self.index_cache.mark_indexed(file_path, file_hash, len(chunks))
-                    stats["new_files"] += 1
-                    stats["chunks"] += len(chunks)
-
-                except Exception as e:
-                    stats["failed"] += 1
-                    logger.error(f"Error processing {file_path.name}: {e}")
-
-            if not documents:
-                logger.info("⚠️  No new documents")
-                return 0
-
-            # embeddings
-            logger.info(f"🔄 Embedding {len(documents)} chunks...")
-
-            all_texts = [doc["text"] for doc in documents]
-            embeddings = self.embedding_model.encode(
-                all_texts,
-                batch_size=self.config.embedding_batch_size,
-                show_progress_bar=self.config.enable_progress_bars,
-                convert_to_numpy=True,
-                normalize_embeddings=self.config.normalize_embeddings,
-            )
-
-            # store to chromadb
-            logger.info("💾 Storing in ChromaDB...")
-            self._add_documents_in_batches(documents, embeddings)
-
-            # BM25 index
-            logger.info("🔄 Building BM25 index...")
-            self.bm25_index.build_index(documents)
-
-            # commit all changes atomically
+        # ---------- 12. Финальный коммит ----------
+        try:
             logger.info("✅ Committing changes...")
             self.index_cache.commit()
-
             self._last_index_time = datetime.now()
 
             logger.info(f"✅ Indexing complete!")
@@ -853,17 +905,10 @@ class HybridRAGSystem:
                 f"{stats['skipped']} skipped, {stats['failed']} failed"
             )
             logger.info(f"   Chunks: {stats['chunks']} added")
-
             return len(documents)
 
-        except KeyboardInterrupt:
-            logger.warning("⚠️  Indexing interrupted by user!")
-            logger.warning("🔄 Rolling back changes...")
-            self.index_cache.rollback()
-            raise
-
-        except Exception as e:
-            logger.error(f"❌ Indexing failed: {e}")
+        except Exception as exc:
+            logger.error(f"❌ Indexing failed during commit: {exc}")
             logger.warning("🔄 Rolling back changes...")
             self.index_cache.rollback()
             raise
@@ -903,12 +948,64 @@ class HybridRAGSystem:
 
     # -------------------------------------------------------------------
     def _extract_pdf_docling(self, file_path: Path) -> Optional[str]:
+        """
+        Извлечение текста из PDF с автоматическим OCR для сканов.
+
+        Стратегия:
+        1. Пробуем извлечь текст напрямую (быстро)
+        2. Если текста мало → запускаем OCR
+        """
         try:
-            converter = DocumentConverter()
+            start = time.perf_counter()
+            # Конфигурация с RapidOCR (или замените на TesseractOcrOptions)
+            pipeline_options = PdfPipelineOptions()
+            pipeline_options.do_ocr = True  # Включаем OCR
+            pipeline_options.ocr_options = RapidOcrOptions(
+                # force_full_page_ocr=False означает "OCR только для изображений/сканов"
+                force_full_page_ocr=False
+            )
+            if self.config.ocr_engine == "rapidocr":
+                ocr_options = RapidOcrOptions()
+            elif self.config.ocr_engine == "tesseract":
+                ocr_options = TesseractOcrOptions(
+                    lang="+".join(self.config.ocr_languages)  # "rus+eng"
+                )
+            else:  # easyocr
+                ocr_options = EasyOcrOptions(lang=self.config.ocr_languages)
+            pipeline_options.ocr_options = ocr_options
+            converter = DocumentConverter(
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(
+                        pipeline_options=pipeline_options
+                    )
+                }
+            )
+
             doc = converter.convert(str(file_path))
-            text_parts = [block.text for block in doc.blocks if hasattr(block, "text") and block.text]
-            return "\n\n".join(text_parts) if text_parts else None
-        except Exception:
+
+            # Извлекаем текст
+            text_parts = []
+            for block in doc.blocks:
+                if hasattr(block, "text") and block.text:
+                    text_parts.append(block.text)
+
+            content = "\n\n".join(text_parts)
+
+            # Проверяем качество извлечения
+            if len(content.strip()) < 100:
+                logger.warning(
+                    f"⚠️ Low text yield from {file_path.name} "
+                    f"({len(content)} chars) - might be scanned"
+                )
+            elapsed = time.perf_counter() - start
+
+            logger.info(
+                f"📄 {file_path.name}: {len(content)} chars "
+                f"in {elapsed:.2f}s ({len(content) / elapsed:.0f} chars/s)"
+            )
+            return content if content else None
+        except Exception as e:
+            logger.error(f"❌ Docling failed on {file_path.name}: {e}")
             return None
 
     # -------------------------------------------------------------------
@@ -1057,6 +1154,20 @@ class HybridRAGSystem:
         logger.info(f"   RRF combined: {len(combined)} unique docs")
 
         return combined
+
+    def _extract_image_ocr(self, file_path: Path) -> Optional[str]:
+        """OCR для standalone изображений"""
+        try:
+            # Docling работает с изображениями "как с PDF"
+            converter = DocumentConverter()
+            doc = converter.convert(str(file_path))
+
+            text = doc.export_to_markdown()
+            return text if text else None
+
+        except Exception as e:
+            logger.error(f"❌ Image OCR failed: {e}")
+            return None
 
     def _rerank_results(self, query: str, results: List[Dict]) -> List[Dict]:
         """
@@ -1221,7 +1332,6 @@ class HybridRAGSystem:
             "timestamp": datetime.now().isoformat(),
         }
 
-    # -------------------------------------------------------------------
     def get_collection_stats(self) -> Dict:
         return {
             "name": self.config.collection_name,
