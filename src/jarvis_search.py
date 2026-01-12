@@ -69,6 +69,9 @@ class SearchConfig:
     ])
     banned_engines: Set[str] = field(default_factory=set)
 
+    # Verbosity
+    print_stats: bool = False # Флаг для отключения вывода статистики в лог
+
     def __post_init__(self):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -277,10 +280,6 @@ class JarvisSearchClient:
     def _simplify_query(self, query: str) -> str:
         """
         Упрощает запрос, убирая специфичные термины и даты
-
-        Examples:
-            "machine learning RAG 2024" → "machine learning retrieval augmented generation"
-            "deep learning transformers 2025" → "deep learning transformers"
         """
         # Убираем годы (1900-2099)
         simplified = re.sub(r'\b(19|20)\d{2}\b', '', query)
@@ -337,16 +336,6 @@ class JarvisSearchClient:
     ) -> Dict:
         """
         Выполняет поиск с retry logic и fallback
-
-        Args:
-            query: Поисковый запрос
-            engines: Список движков (None = использовать preferred_engines)
-            category: Категория ('general', 'science', 'it', 'news')
-            max_results: Ограничение количества результатов
-            simplify_on_failure: Упрощать запрос при пустых результатах
-
-        Returns:
-            Dict с ключами: results, query, engines_used, from_cache
         """
         self.stats["total_queries"] += 1
         original_query = query  # Сохраняем оригинал
@@ -455,15 +444,26 @@ class JarvisSearchClient:
         async with self.semaphore:
             await self.rate_limiter.acquire()
 
+            # --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
             # Строим параметры
             params = {
                 "q": query,
-                "format": "json",
-                "engines": ",".join(engines)
+                "format": "json",       # JSON нам всё равно нужен для скрипта
+                # "engines": ",".join(engines),  <-- ЗАКОММЕНТИРУЙТЕ ЭТУ СТРОКУ
+                "language": "auto",     # <-- Добавьте это (или "ru", "en")
             }
+            # Если движки переданы явно и их мало (например, при retry), можно раскомментировать,
+            # но для первого запроса лучше довериться настройкам SearXNG.
+
+            # Логика: если engines передан (например, при fallback), используем.
+            # Но лучше попробовать сначала БЕЗ ограничений.
+            if engines and len(engines) < 4:
+                # Используем engines только если это fallback (когда список короткий)
+                params["engines"] = ",".join(engines)
 
             if category:
                 params["categories"] = category
+            # -----------------------
 
             if max_results:
                 params["pageno"] = 1  # Ограничиваем одной страницей
@@ -539,28 +539,34 @@ class JarvisSearchClient:
         return clean_results
 
     def print_stats(self):
-        """Выводит статистику работы"""
-        print("\n" + "=" * 70)
-        print("📊 JARVIS SEARCH STATISTICS")
-        print("=" * 70)
-        print(f"Total queries:      {self.stats['total_queries']}")
+        """Выводит статистику работы В ЛОГГЕР, а не в print"""
+        # Если отключена печать статистики в конфиге - не пишем ничего
+        if not self.config.print_stats:
+            return
+
+        # Формируем сообщение и пишем в logger.info
+        msg = ["\n" + "=" * 70, "📊 JARVIS SEARCH STATISTICS", "=" * 70]
+        msg.append(f"Total queries:      {self.stats['total_queries']}")
 
         if self.stats['total_queries'] > 0:
             hit_rate = self.stats['cache_hits'] / self.stats['total_queries'] * 100
-            print(f"Cache hits:         {self.stats['cache_hits']} ({hit_rate:.1f}%)")
+            msg.append(f"Cache hits:         {self.stats['cache_hits']} ({hit_rate:.1f}%)")
         else:
-            print(f"Cache hits:         {self.stats['cache_hits']}")
+            msg.append(f"Cache hits:         {self.stats['cache_hits']}")
 
-        print(f"Cache misses:       {self.stats['cache_misses']}")
-        print(f"Total results:      {self.stats['total_results']}")
-        print(f"Simplified queries: {self.stats['simplified_queries']}")
+        msg.append(f"Cache misses:       {self.stats['cache_misses']}")
+        msg.append(f"Total results:      {self.stats['total_results']}")
+        msg.append(f"Simplified queries: {self.stats['simplified_queries']}")
 
         if self.stats['engine_errors']:
-            print("\nEngine errors:")
+            msg.append("\nEngine errors:")
             for engine, count in self.stats['engine_errors'].items():
-                print(f"  {engine}: {count}")
+                msg.append(f"  {engine}: {count}")
 
-        print("=" * 70 + "\n")
+        msg.append("=" * 70 + "\n")
+
+        # Пишем одной записью
+        logger.info("\n".join(msg))
 
     async def health_check(self) -> Dict:
         """Проверяет доступность SearXNG"""
@@ -722,7 +728,7 @@ async def smart_search(
     logger.info(f"🌐 Unique domains: {stats['unique_domains']}")
     logger.debug(f"Domain distribution: {stats['domain_distribution']}")
 
-    # Статистика клиента
+    # Статистика клиента (выводит в лог, если разрешено, или игнорирует)
     client.print_stats()
 
     return unique_results
@@ -733,19 +739,12 @@ async def smart_search(
 # =====================================================================
 
 async def main():
-    """Точка входа для CLI"""
+    """Точка входа для CLI (использует print для пользователя)"""
     import argparse
 
     parser = argparse.ArgumentParser(
         description="Jarvis Search Engine - Production-ready SearXNG client",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-        Examples:
-          python jarvis_search_v2.py "deep learning"
-          python jarvis_search_v2.py --verbose "RAG 2024"
-          python jarvis_search_v2.py --clear-cache
-          python jarvis_search_v2.py --repair-cache
-        """
     )
 
     parser.add_argument('queries', nargs='*', help='Search queries')
@@ -754,13 +753,20 @@ async def main():
     parser.add_argument('--cache-ttl', type=int, default=3600, help='Cache TTL in seconds')
     parser.add_argument('--no-cache', action='store_true', help='Disable cache')
     parser.add_argument('--clear-cache', action='store_true', help='Clear cache and exit')
-    parser.add_argument('--repair-cache', action='store_true', help='Repair corrupted cache files')  # NEW!
+    parser.add_argument('--repair-cache', action='store_true', help='Repair corrupted cache files')
     parser.add_argument('--health-check', action='store_true', help='Check SearXNG health')
 
     args = parser.parse_args()
 
+    # Для CLI включаем вывод в консоль
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    logging.getLogger().addHandler(console_handler)
+
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+    else:
+        logging.getLogger().setLevel(logging.INFO)
 
     config = SearchConfig(
         base_url="http://localhost:8080",
@@ -768,7 +774,8 @@ async def main():
         max_delay=2.0,
         max_concurrent=5,
         max_retries=3,
-        cache_ttl=args.cache_ttl if not args.no_cache else 0
+        cache_ttl=args.cache_ttl if not args.no_cache else 0,
+        print_stats=True # Для CLI включаем статистику
     )
 
     cache = SearchCache(config.cache_dir, config.cache_ttl)
@@ -796,44 +803,34 @@ async def main():
     if args.queries:
         queries = args.queries
     else:
-        # Тестовые запросы
-        queries = [
-            "RAG новшества 2025 год",
-            "retrieval‑augmented generation тренды 2025",
-            "внедрение RAG в production 2025",
-            "сравнение LLM RAG и без RAG 2025",
-            "case study RAG 2025 успехи"
-        ]
-        print(f"📝 Using {len(queries)} test queries\n")
+        queries = ["RAG новшества 2025"]
+        print(f"📝 Using test query: {queries}\n")
 
     # Выполняем поиск
     results = await smart_search(queries, max_sources=args.max_sources, config=config)
 
-    # Выводим результаты
+    # Выводим результаты для пользователя через print
     print("\n" + "=" * 70)
     print("🎯 FINAL RESULTS")
     print("=" * 70)
 
     if not results:
-        print("\n❌ No results found. Troubleshooting:")
-        print("  1. Check SearXNG: docker ps | grep searxng")
-        print("  2. View logs: docker logs jarvis-searxng")
-        print("  3. Test manually: curl 'http://localhost:8080/search?q=test&format=json'")
-        print("  4. Health check: python jarvis_search_v2.py --health-check")
-        print("  5. Enable verbose: python jarvis_search_v2.py --verbose")
+        print("\n❌ No results found.")
         return
 
     for i, result in enumerate(results, 1):
         title = result.get('title', 'No title')
         url = result.get('url', 'No URL')
         engine = result.get('engine', 'unknown')
-        snippet = result.get('content', '')[:150]
 
-        print(f"\n{i}. {title}")
-        print(f"   URL: {url}")
-        print(f"   Engine: {engine}")
-        if snippet:
-            print(f"   {snippet}...")
+        # Безопасный вывод для консоли Windows
+        try:
+            print(f"\n{i}. {title}")
+            print(f"   URL: {url}")
+            print(f"   Engine: {engine}")
+        except UnicodeEncodeError:
+            print(f"\n{i}. [Unicode Error in Title]")
+            print(f"   URL: {url}")
 
     print("\n" + "=" * 70)
 
@@ -846,3 +843,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.exception("Fatal error:")
         print(f"\n❌ Fatal error: {e}")
+
