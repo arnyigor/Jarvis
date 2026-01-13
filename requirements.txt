@@ -1,0 +1,7 @@
+mcp
+streamlit
+chromadb
+sentence-transformers
+rank_bm25
+openai
+tqdm

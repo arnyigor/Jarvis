@@ -14,6 +14,8 @@ from typing import List, Dict
 
 import numpy as np
 
+from src.hybrid_rag_system import HybridConfig, HybridRAGSystem
+
 
 # -------------------------------------------------------------------
 # КАТЕГОРИЯ 1: Тесты качества поиска (Quality Metrics)
@@ -174,7 +176,6 @@ class TestStressPerformance(unittest.IsolatedAsyncioTestCase):
 
     @classmethod
     def setUpClass(cls):
-        from src.hybrid_rag_system import HybridRAGSystem, HybridConfig
 
         cls.test_dir = Path("test_data_integration")
         cls.config = HybridConfig(

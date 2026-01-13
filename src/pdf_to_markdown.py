@@ -2,261 +2,247 @@
 # -*- coding: utf-8 -*-
 
 """
-pdf_to_markdown.py
-
-CLI‑утилита для конвертации PDF‑документов в Markdown.
-Поддержка чтения входных/выходных путей из ``.env`` файла
-(для удобства тестирования и CI‑пайпов).
+pdf_to_markdown_v3.py
+Оптимизированная версия для Docling v2 с улучшенным управлением памятью и VLM.
 """
 
 import argparse
 import logging
 import os
-import sys
+import gc
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional
 
-# ----------------------------------------------------------------------
-# Попытка загрузить переменные окружения из .env (необязательно)
-# ----------------------------------------------------------------------
+# --- Загрузка окружения ---
 try:
-    from dotenv import load_dotenv  # type: ignore
-
-    load_dotenv()   # ищет .env в текущей рабочей директории и выше
-except Exception:  # pragma: no cover
-    # Если ``python‑dotenv`` не установлен – просто игнорируем.
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
     pass
 
+# --- Импорты Docling и Torch ---
+try:
+    import torch
+except ImportError:
+    torch = None
 
-# ----------------------------------------------------------------------
-# Зависимости Docling (>=1.20.0)
-# ----------------------------------------------------------------------
 try:
     from docling.document_converter import (
         DocumentConverter,
-        PdfFormatOption,          # формат‑опция для PDF
-        InputFormat,             # перечисление форматов ввода
+        PdfFormatOption,
+        InputFormat,
     )
-    from docling.datamodel.accelerator_options import (
-        AcceleratorDevice,
+    from docling.datamodel.pipeline_options import (
+        PdfPipelineOptions,
+        TableFormerMode,
         AcceleratorOptions,
+        AcceleratorDevice
     )
-    from docling.datamodel.pipeline_options import ThreadedPdfPipelineOptions
-except Exception as exc:  # pragma: no cover
+    from docling.datamodel.base_models import InputFormat
+    from docling_core.types.doc import ImageRefMode, ContentLayer
+except ImportError as exc:
     raise RuntimeError(
-        f"Не удалось импортировать Docling API. Убедитесь, что "
-        f"docling>=1.20.0 установлен.\n{exc}"
+        "Docling не установлен или версия несовместима. "
+        "Установите: pip install docling[torch]"
     ) from exc
 
-
-# ----------------------------------------------------------------------
-# Опционально – PyTorch для CUDA‑ускорения
-# ----------------------------------------------------------------------
-try:
-    import torch  # type: ignore
-except Exception:
-    torch = None   # Путь без GPU будет использоваться
-
-LOGGER = logging.getLogger("pdf_to_markdown")
+LOGGER = logging.getLogger("docling_worker")
 
 
-def detect_cuda_available() -> bool:
+def get_torch_device(force_cpu: bool = False) -> str:
+    """Определяет доступное устройство."""
+    if force_cpu or torch is None or not torch.cuda.is_available():
+        return "cpu"
+    return "cuda"
+
+
+def cleanup_gpu():
+    """Принудительная очистка VRAM."""
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    gc.collect()
+
+
+def build_converter(
+        device_str: str,
+        artifacts_path: Optional[Path] = None,
+        enable_vlm: bool = False,
+        batch_size_mult: float = 1.0
+) -> DocumentConverter:
     """
-    Проверяет, доступна ли CUDA для PyTorch.
-
-    Возвращает:
-        bool: ``True`` если модуль ``torch`` установлен и
-              ``torch.cuda.is_available() == True``.
+    Создает конвертер с явной типизацией параметров.
+    batch_size_mult: множитель для уменьшения/увеличения дефолтных батчей.
     """
-    if torch is None:
-        return False
 
-    try:
-        return bool(torch.cuda.is_available())
-    except Exception:
-        # На некоторых платформах может быть отсутствует атрибут .cuda
-        return False
-
-
-def build_converter(use_gpu: bool) -> DocumentConverter:
-    """
-    Создаёт конвертер Docling с оптимальными настройками ускорения.
-
-    В Docling 1.20+ конструктор принимает *словарь* `format_options`,
-    где ключ – это `InputFormat`, а значение – объект `FormatOption`.
-    Для PDF мы создаём `PdfFormatOption` и передаём туда наш
-    ``ThreadedPdfPipelineOptions`` (batch‑size, ускоритель и т.п.).
-    """
-    if use_gpu and detect_cuda_available():
-        device = AcceleratorDevice.CUDA
-        LOGGER.info("CUDA обнаружена, использование GPU.")
+    # 1. Настройка ускорителя
+    if device_str == "cuda":
+        acc_device = AcceleratorDevice.CUDA
+        # Базовые значения для GPU (можно тюнить множителем)
+        num_threads = 4
+        pipeline_batch_size = int(16 * batch_size_mult)
+        ocr_batch_size = int(32 * batch_size_mult)
     else:
-        device = AcceleratorDevice.CPU
-        if use_gpu:
-            LOGGER.warning(
-                "Флаг --gpu включён, но CUDA недоступна. Переходим на CPU."
-            )
-        else:
-            LOGGER.debug("Запуск в режиме CPU.")
+        acc_device = AcceleratorDevice.CPU
+        num_threads = os.cpu_count() or 8
+        pipeline_batch_size = 4
+        ocr_batch_size = 4
 
-    accelerator_options = AcceleratorOptions(device=device)
-
-    pipeline_options = ThreadedPdfPipelineOptions(
-        accelerator_options=accelerator_options,
-        layout_batch_size=16 if device == AcceleratorDevice.CUDA else 8,
-        ocr_batch_size=16 if device == AcceleratorDevice.CUDA else 4,
-        table_batch_size=4,
+    acc_options = AcceleratorOptions(
+        num_threads=num_threads,
+        device=acc_device
     )
 
-    # ------------------------------------------------------------------
-    # Формируем словарь format_options для PDF
-    # ------------------------------------------------------------------
-    pdf_format_option = PdfFormatOption(
-        pipeline_options=pipeline_options,
+    # 2. Настройка пайплайна
+    # В Docling v2 параметры часто группируются
+    pipeline_opts = PdfPipelineOptions(
+        accelerator_options=acc_options,
+        do_ocr=True,
+        do_table_structure=True,
+        do_formula_enrichment=True,
+        # VLM (описание картинок) - самая ресурсоемкая операция
+        do_picture_description=enable_vlm,
     )
 
-    converter = DocumentConverter(
-        format_options={InputFormat.PDF: pdf_format_option}
+    # Применяем размеры батчей (если атрибуты существуют в текущей версии Docling)
+    # Используем явное присваивание, ожидая, что API стабилен для v2+
+    if hasattr(pipeline_opts, "layout_batch_size"):
+        pipeline_opts.layout_batch_size = pipeline_batch_size
+
+    if hasattr(pipeline_opts, "ocr_options") and hasattr(pipeline_opts.ocr_options, "batch_size"):
+        # В некоторых версиях OCR options вложены
+        pass
+    elif hasattr(pipeline_opts, "ocr_batch_size"):
+        pipeline_opts.ocr_batch_size = ocr_batch_size
+
+    # Настройка таблиц
+    if hasattr(pipeline_opts, "table_structure_options"):
+        pipeline_opts.table_structure_options.mode = TableFormerMode.ACCURATE
+
+    # Указание пути к моделям (если нужно офлайн использование)
+    if artifacts_path:
+        pipeline_opts.artifacts_path = str(artifacts_path)
+
+    # 3. Сборка
+    return DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_opts)
+        }
     )
-    return converter
 
 
-def convert_pdf_to_markdown(
+def convert_pdf(
         input_path: Path,
         output_path: Optional[Path] = None,
         use_gpu: bool = False,
-        strict_text: bool = False,
+        describe_images: bool = False,
         overwrite: bool = False,
+        batch_mult: float = 1.0
 ) -> Path:
-    """Конвертирует PDF‑файл в Markdown."""
-    if not input_path.exists():
-        raise FileNotFoundError(f"Входной файл не найден: {input_path}")
-    if input_path.is_dir():
-        raise IsADirectoryError(
-            f"Ожидался файл, но получена директория: {input_path}"
-        )
 
-    output_path = Path(output_path or input_path.with_suffix(".md"))
+    if not input_path.exists():
+        raise FileNotFoundError(f"Файл не найден: {input_path}")
+
+    if output_path is None:
+        output_path = input_path.with_suffix(".md")
 
     if output_path.exists() and not overwrite:
-        raise FileExistsError(
-            f"Файл {output_path} уже существует. "
-            "Укажите --overwrite для перезаписи."
+        LOGGER.warning(f"Файл {output_path.name} существует. Пропуск.")
+        return output_path
+
+    # Определение устройства
+    device = get_torch_device(force_cpu=not use_gpu)
+    LOGGER.info(f"🔧 Device: {device.upper()} | VLM: {describe_images} | Batch x{batch_mult}")
+
+    try:
+        converter = build_converter(
+            device_str=device,
+            enable_vlm=describe_images,
+            batch_size_mult=batch_mult
         )
 
-    converter = build_converter(use_gpu=use_gpu)
+        LOGGER.info(f"🚀 Processing: {input_path.name}")
 
-    LOGGER.info("Начинаем конвертацию: %s → %s", input_path, output_path)
-    try:
-        conv_result = converter.convert(str(input_path))
-        doc = conv_result.document
-    except Exception as exc:  # pragma: no cover
-        LOGGER.exception("Ошибка Docling при конвертации %s", input_path)
-        raise RuntimeError(f"Docling‑превращение завершилось ошибкой: {exc}") from exc
+        # Конвертация
+        res = converter.convert(str(input_path))
+        doc = res.document
 
-    markdown_text = doc.export_to_markdown(strict_text=strict_text)
+        # Экспорт
+        # image_mode=MARKDOWN создает ссылки, но для VLM важно, чтобы описание попало в текст.
+        # В Docling описание картинки обычно добавляется в контент-блок Picture.
+        md_text = doc.export_to_markdown(
+            image_mode=ImageRefMode.REFERENCED,
+            image_placeholder="*[Image Description]*",
+        )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        output_path.write_text(markdown_text, encoding="utf-8")
-    except OSError as exc:  # pragma: no cover
-        LOGGER.exception("Не удалось записать Markdown в %s", output_path)
-        raise RuntimeError(f"Ошибка записи файла {output_path}: {exc}") from exc
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(md_text, encoding="utf-8")
 
-    LOGGER.info("Конвертация завершена, файл сохранён в %s", output_path)
-    return output_path
+        LOGGER.info(f"✅ Saved to: {output_path}")
+        return output_path
+
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            LOGGER.error("❌ GPU OOM Error. Попробуйте уменьшить --batch-mult (например 0.5)")
+        raise e
+    except Exception as e:
+        LOGGER.exception(f"❌ Critical error processing {input_path.name}")
+        raise
+    finally:
+        # Важно очищать ресурсы, особенно если скрипт будет встроен в цикл
+        cleanup_gpu()
 
 
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    """
-    Разбирает аргументы командной строки. Путь входного PDF – обязательный.
-    """
-    parser = argparse.ArgumentParser(
-        description="Преобразование PDF в Markdown с помощью Docling."
+def main():
+    parser = argparse.ArgumentParser(description="Docling PDF to Markdown Converter")
+
+    # Основные аргументы
+    parser.add_argument("pdf", type=Path, nargs="?", help="Input PDF path")
+    parser.add_argument("-o", "--output", type=Path, help="Output MD path")
+
+    # Флаги
+    parser.add_argument("--gpu", action="store_true", help="Enable GPU acc")
+    parser.add_argument("--vlm", action="store_true", help="Enable Vision Language Model for images")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
+
+    # Тюнинг
+    parser.add_argument("--batch-mult", type=float, default=1.0,
+                        help="Batch size multiplier (0.5 for low VRAM, 2.0 for A100)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Debug logs")
+
+    # Defaults from ENV
+    parser.set_defaults(
+        gpu=os.getenv("PDF_TO_MD_USE_GPU", "false").lower() in ("true", "1", "yes"),
+        vlm=os.getenv("PDF_TO_MD_VLM", "false").lower() in ("true", "1", "yes"),
+        overwrite=os.getenv("PDF_TO_MD_OVERWRITE", "false").lower() in ("true", "1", "yes"),
     )
-    parser.add_argument("pdf", type=Path, help="Путь к входному PDF‑файлу.")
-    parser.add_argument(
-        "-o",
-        "--output",
-        type=Path,
-        help=(
-            "Путь к выходному .md‑файлу (по умолчанию: тот же путь с "
-            "расширением .md)."
-        ),
-    )
-    parser.add_argument("--gpu", action="store_true", help="Использовать CUDA, если доступна.")
-    parser.add_argument(
-        "--strict-text",
-        action="store_true",
-        help="Экспортировать только текст (полезен для RAG).",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Перезаписывать существующий файл вывода.",
-    )
-    parser.add_argument("-v", "--verbose", action="store_true", help="Вывод DEBUG‑лога.")
-    return parser.parse_args(argv)
 
+    args = parser.parse_args()
 
-def configure_logging(verbose: bool) -> None:
-    """Настраивает базовое логирование."""
-    level = logging.DEBUG if verbose else logging.INFO
+    # Fallback для Input
+    if not args.pdf:
+        env_path = os.getenv("PDF_PATH")
+        if env_path:
+            args.pdf = Path(env_path).resolve()
+        else:
+            parser.error("Не указан входной файл (аргумент или PDF_PATH в .env)")
+
+    # Логгирование
     logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s [%(levelname)s] Docling: %(message)s",
+        datefmt="%H:%M:%S"
     )
 
-
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    """
-    Точка входа CLI. Возвращает код возврата: 0 – успех, 1 – ошибка.
-    Поддержка чтения пути PDF/Markdown из переменных окружения
-    ``PDF_INPUT`` и ``PDF_OUTPUT`` (необязательно).
-    """
-
-    # --------------------------------------------------------------
-    # Конструируем argv с учётом .env‑переменных
-    # --------------------------------------------------------------
-    argv_list: list[str]
-    if argv is None:
-        argv_list = sys.argv[1:]
-    else:
-        argv_list = list(argv)  # копия, чтобы не мутировать переданное значение
-
-    pdf_env = os.getenv("PDF_INPUT")
-    output_env = os.getenv("PDF_OUTPUT")
-
-    # Если позиционный аргумент отсутствует – берём из env
-    if not any(not arg.startswith("-") for arg in argv_list) and pdf_env:
-        argv_list.insert(0, pdf_env)
-
-    # Добавляем флаг вывода, если он не задан и присутствует в env
-    if (
-            "-o" not in argv_list
-            and "--output" not in argv_list
-            and output_env
-    ):
-        argv_list.extend(["-o", output_env])
-
-    args = parse_args(argv_list)
-    configure_logging(args.verbose)
-
-    try:
-        convert_pdf_to_markdown(
-            input_path=args.pdf,
-            output_path=args.output,
-            use_gpu=args.gpu,
-            strict_text=args.strict_text,
-            overwrite=args.overwrite,
-        )
-    except Exception as exc:  # pragma: no cover
-        LOGGER.error("Произошла ошибка: %s", exc)
-        return 1
-
-    return 0
-
+    # Запуск
+    convert_pdf(
+        args.pdf,
+        args.output,
+        use_gpu=args.gpu,
+        describe_images=args.vlm,
+        overwrite=args.overwrite,
+        batch_mult=args.batch_mult
+    )
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

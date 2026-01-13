@@ -42,6 +42,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+]
+
 # =====================================================================
 # CONFIGURATION
 # =====================================================================
@@ -216,27 +223,45 @@ class AdaptiveRateLimiter:
         self.lock = asyncio.Lock()
 
     async def acquire(self):
-        """Ждёт перед следующим запросом"""
+        """Ждёт перед следующим запросом (Adaptive Token Bucket)"""
         async with self.lock:
             now = time.time()
             elapsed = now - self.last_request_time
 
-            # Вычисляем задержку (увеличиваем при ошибках)
-            base_delay = self.min_delay * (1.5 ** self.consecutive_errors)
-            base_delay = min(base_delay, self.max_delay)
+            # 1. Рассчитываем базовую задержку
+            if self.consecutive_errors > 0:
+                # РЕЖИМ ОШИБОК: Агрессивное замедление
+                # 2 ошибки -> 2.25x, 3 ошибки -> 3.3x, 4 ошибки -> 5x
+                multiplier = 1.5 ** min(self.consecutive_errors, 4)
+                base_delay = self.min_delay * multiplier
 
-            # Добавляем jitter (случайное варьирование)
-            if self.jitter:
-                delay = base_delay + random.uniform(0, base_delay * 0.5)
+                # Добавляем СИЛЬНЫЙ рандом, чтобы сбить паттерны блокировок
+                # Например, ждать от 100% до 200% расчетного времени
+                jitter_factor = random.uniform(1.0, 2.0)
             else:
-                delay = base_delay
+                # ШТАТНЫЙ РЕЖИМ: Работаем быстро
+                base_delay = self.min_delay
+                # Легкий джиттер (±20%), просто чтобы не долбить ровно в такт
+                jitter_factor = random.uniform(0.8, 1.2)
 
-            # Ждём, если нужно
-            if elapsed < delay:
-                wait_time = delay - elapsed
-                logger.debug(f"⏱️ Rate limit: waiting {wait_time:.2f}s")
-                await asyncio.sleep(wait_time)
+            actual_delay = base_delay * jitter_factor
 
+            # Ограничиваем сверху разумным пределом (например, 20-30 сек)
+            # Чтобы не ждать вечно при серии ошибок
+            actual_delay = min(actual_delay, self.max_delay)
+
+            # 2. Ждем
+            wait_needed = actual_delay - elapsed
+            if wait_needed > 0:
+                # Логируем только значительные ожидания (>1с), чтобы не мусорить
+                if wait_needed > 1.0 or self.consecutive_errors > 0:
+                    logger.debug(
+                        f"⏱️ Pacing: waiting {wait_needed:.2f}s "
+                        f"(errors={self.consecutive_errors}, target_delay={actual_delay:.2f}s)"
+                    )
+                await asyncio.sleep(wait_needed)
+
+            # 3. Обновляем время
             self.last_request_time = time.time()
 
     def report_success(self):
@@ -439,81 +464,111 @@ class JarvisSearchClient:
             category: Optional[str],
             max_results: Optional[int]
     ) -> Dict:
-        """Внутренний метод с rate limiting"""
+        """
+        Внутренний метод выполнения HTTP-запроса к SearXNG с учетом Rate Limiting.
+        Обрабатывает параметры, делает запрос и возвращает сырой JSON.
+        """
 
+        # 1. Глобальный семафор (ограничение параллелизма)
         async with self.semaphore:
+            # 2. Умная задержка (Rate Limiter)
             await self.rate_limiter.acquire()
 
-            # --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
-            # Строим параметры
+            # --- Формирование параметров запроса ---
             params = {
                 "q": query,
-                "format": "json",       # JSON нам всё равно нужен для скрипта
-                # "engines": ",".join(engines),  <-- ЗАКОММЕНТИРУЙТЕ ЭТУ СТРОКУ
-                "language": "auto",     # <-- Добавьте это (или "ru", "en")
+                "format": "json",
+                "language": "auto",  # Автоопределение языка для релевантности
             }
-            # Если движки переданы явно и их мало (например, при retry), можно раскомментировать,
-            # но для первого запроса лучше довериться настройкам SearXNG.
 
-            # Логика: если engines передан (например, при fallback), используем.
-            # Но лучше попробовать сначала БЕЗ ограничений.
+            # Логика выбора движков:
+            # - Если список engines длинный (или дефолтный) -> НЕ отправляем его,
+            #   пусть SearXNG использует все включенные в settings.yml движки.
+            # - Если список короткий (fallback, например, только duckduckgo) -> принудительно используем.
+            engines_param_used = False
             if engines and len(engines) < 4:
-                # Используем engines только если это fallback (когда список короткий)
                 params["engines"] = ",".join(engines)
+                engines_param_used = True
 
             if category:
                 params["categories"] = category
-            # -----------------------
 
             if max_results:
-                params["pageno"] = 1  # Ограничиваем одной страницей
+                params["pageno"] = 1  # Запрашиваем только первую страницу для скорости
 
-            url = f"{self.config.base_url}/search?{urlencode(params)}"
+            # Формируем URL (кодируем параметры правильно)
+            query_string = urlencode(params)
+            url = f"{self.config.base_url}/search?{query_string}"
+
+            # Скрываем полный URL в INFO логах, показываем только в DEBUG
             logger.debug(f"🔗 Request: {url}")
 
             timeout = aiohttp.ClientTimeout(total=self.config.timeout)
 
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as response:
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    # Добавляем User-Agent, чтобы прикинуться браузером (защита от некоторых банов)
+                    headers = {
+                        "User-Agent": random.choice(USER_AGENTS)
+                    }
 
-                    if response.status == 200:
-                        data = await response.json()
-                        results = data.get("results", [])
+                    async with session.get(url, headers=headers) as response:
 
-                        # Обрезаем до max_results
-                        if max_results:
-                            results = results[:max_results]
+                        if response.status == 200:
+                            data = await response.json()
+                            results = data.get("results", [])
 
-                        # Статистика по движкам (для debug)
-                        if logger.isEnabledFor(logging.DEBUG):
-                            engine_counts = {}
-                            for r in results:
-                                engine = r.get("engine", "unknown")
-                                engine_counts[engine] = engine_counts.get(engine, 0) + 1
-                            logger.debug(f"Engine breakdown: {engine_counts}")
+                            if not results:
+                                # Если SearXNG вернул 200, но результатов 0 — это подозрительно (скорее всего бан движка)
+                                # Генерируем ошибку, чтобы сработал механизм Retry в вызывающем коде
+                                logger.warning(f"⚠️ SearXNG returned 0 results for '{query}'. Treating as error.")
+                                raise aiohttp.ClientError("Empty results from SearXNG")
+                                                    # СБРОС СЧЕТЧИКА ОШИБОК!
+                            # Это критически важно, чтобы система "разогналась" после сбоев.
+                            self.rate_limiter.consecutive_errors = 0
 
-                        logger.info(
-                            f"✅ '{query[:50]}...' → {len(results)} results "
-                            f"(engines: {engines})"
-                        )
+                            if max_results:
+                                results = results[:max_results]
 
-                        return {
-                            "results": results,
-                            "query": query,
-                            "engines_used": engines
-                        }
+                            # Статистика по движкам (для отладки)
+                            if logger.isEnabledFor(logging.DEBUG):
+                                engine_counts = {}
+                                for r in results:
+                                    eng = r.get("engine", "unknown")
+                                    engine_counts[eng] = engine_counts.get(eng, 0) + 1
+                                logger.debug(f"Engine breakdown: {engine_counts}")
 
-                    elif response.status == 429:
-                        # Rate limit от SearXNG
-                        logger.warning(f"⚠️ 429 Rate Limit from SearXNG")
-                        raise aiohttp.ClientError("Rate limited by SearXNG")
+                            used_str = str(engines) if engines_param_used else "ALL (Auto)"
+                            logger.info(
+                                f"✅ '{query[:30]}...' → {len(results)} results "
+                                f"(engines: {used_str})"
+                            )
 
-                    else:
-                        error_text = await response.text()
-                        logger.error(
-                            f"❌ HTTP {response.status}: {error_text[:200]}"
-                        )
-                        raise aiohttp.ClientError(f"HTTP {response.status}")
+                            return {
+                                "results": results,
+                                "query": query,
+                                "engines_used": engines if engines_param_used else None
+                            }
+
+                        elif response.status == 429:
+                            # --- RATE LIMIT ---
+                            logger.warning(f"⚠️ 429 Rate Limit from SearXNG instance")
+                            # Увеличиваем счетчик ошибок в Rate Limiter, чтобы замедлиться
+                            self.rate_limiter.consecutive_errors += 1
+                            raise aiohttp.ClientError("SearXNG Rate Limit (429)")
+
+                        else:
+                            # --- ПРОЧИЕ ОШИБКИ ---
+                            error_text = await response.text()
+                            logger.error(f"❌ HTTP {response.status}: {error_text[:200]}")
+                            self.rate_limiter.consecutive_errors += 1
+                            raise aiohttp.ClientError(f"HTTP {response.status}")
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                # Ловим сетевые ошибки и таймауты
+                self.rate_limiter.consecutive_errors += 1
+                logger.error(f"❌ Network/Timeout error for '{query}': {str(e)}")
+                raise
 
     async def parallel_search(self, queries: List[str]) -> List[Dict]:
         """Параллельный поиск с семафором"""
