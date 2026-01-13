@@ -4,12 +4,9 @@
 """
 mcp_server.py
 
-Runs a FastMCP server that exposes a web-search tool powered by jarvis_search_v2.
+Runs a FastMCP server that exposes web-search tools powered by jarvis_search_v2 AND Yandex Selenium.
 Implements robust, cross-platform logging (no external dependencies), structured error handling,
 and correlation IDs for distributed tracing.
-
-Author:   Distinguished Software Architect
-License:  MIT
 """
 
 from __future__ import annotations
@@ -18,10 +15,12 @@ import os
 import sys
 import uuid
 import logging
+import asyncio
+import contextlib
 from datetime import datetime
 from logging import DEBUG
 from logging.handlers import RotatingFileHandler
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 # --------------------------------------------------------------------------- #
 # Logging Configuration — Cross-Platform ISO 8601 with Microsecond Precision
@@ -30,168 +29,187 @@ from typing import Any, Dict
 LOG_LEVEL = os.getenv("MCP_LOG_LEVEL", "DEBUG").upper()
 
 class ISO8601Formatter(logging.Formatter):
-    """
-    Custom logging formatter that emits timestamps in ISO 8601 format with microsecond precision.
-    Uses datetime.isoformat() instead of time.strftime() to ensure compatibility on Windows.
-
-    Output example: 2025-04-05T16:38:22.123456Z
-    """
-
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
-        """
-        Override to use datetime.isoformat() for full ISO 8601 support including microseconds.
-        This avoids the %f strftime limitation on Windows.
-        """
         ct = datetime.fromtimestamp(record.created)
         if datefmt:
             return ct.strftime(datefmt)
-        # Use microsecond precision (6 digits) and append 'Z' to indicate UTC
         return ct.isoformat(timespec='microseconds') + 'Z'
 
-
-# Define message format with correlation ID support
 MSG_FMT = "%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s"
-
-# Create formatter instance
 formatter = ISO8601Formatter(fmt=MSG_FMT)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE_PATH = os.path.join(SCRIPT_DIR, "mcp_debug.log")
-# File handler: rotates at 5MB, keeps 5 backups
+
 file_handler = RotatingFileHandler(
-    filename=LOG_FILE_PATH,  # <-- ИЗМЕНЕНИЕ ЗДЕСЬ
+    filename=LOG_FILE_PATH,
     maxBytes=5_000_000,
     backupCount=5,
     encoding="utf-8",
 )
 file_handler.setFormatter(formatter)
 
-# Optional console output — comment out in production
-console_handler = logging.StreamHandler()
+console_handler = logging.StreamHandler(sys.stderr) # ВАЖНО: Логи только в stderr, stdout занят MCP
 console_handler.setFormatter(formatter)
 
-# Configure root logger
 root_logger = logging.getLogger()
 root_logger.setLevel(DEBUG)
 root_logger.addHandler(file_handler)
-root_logger.addHandler(console_handler)  # <-- Remove this line in production
+root_logger.addHandler(console_handler)
 
 logger: logging.Logger = root_logger.getChild(__name__)
 
 # --------------------------------------------------------------------------- #
-# FastMCP Imports — Graceful Failure Handling
+# FastMCP Imports
 # --------------------------------------------------------------------------- #
 
 try:
-    from mcp.server.fastmcp import FastMCP  # type: ignore
+    from mcp.server.fastmcp import FastMCP
 except ImportError as exc:
-    logger.critical("Failed to import FastMCP. Is 'python-mcp' installed? Error: %s", exc, exc_info=True)
+    logger.critical("Failed to import FastMCP. Error: %s", exc, exc_info=True)
     sys.exit(1)
 
 # --------------------------------------------------------------------------- #
-# Search Module Imports — Graceful Failure Handling
+# Search Module Imports
 # --------------------------------------------------------------------------- #
 
+# 1. Jarvis / SearXNG
 try:
-    from jarvis_search import smart_search, SearchConfig  # type: ignore
-except ImportError as exc:
-    logger.critical("jarvis_search module not found. Ensure 'jarvis_search.py' is in PYTHONPATH. Error: %s", exc)
-    sys.exit(1)
+    from jarvis_search import smart_search, SearchConfig
+except ImportError:
+    logger.warning("jarvis_search module not found. 'search_web' tool will fail if called.")
+
+# 2. Yandex Selenium Scraper
+try:
+    # Предполагаем, что файл называется yandex_search.py
+    from search_links_cli import get_links_from_yandex
+except ImportError:
+    logger.warning("yandex_search module not found. 'search_yandex_selenium' tool will fail if called.")
 
 # --------------------------------------------------------------------------- #
-# Tool Definition — Web Search via SearXNG
+# Helper: Redirect Stdout Protection
+# --------------------------------------------------------------------------- #
+
+@contextlib.contextmanager
+def protect_stdout():
+    """
+    Context manager to prevent external libraries (like Selenium/Drivers)
+    from writing to stdout, which would break the MCP JSON-RPC protocol.
+    Redirects stdout to stderr temporarily.
+    """
+    original_stdout = sys.stdout
+    try:
+        sys.stdout = sys.stderr
+        yield
+    finally:
+        sys.stdout = original_stdout
+
+# --------------------------------------------------------------------------- #
+# Tool Definition
 # --------------------------------------------------------------------------- #
 
 mcp = FastMCP("JarvisSearch")
 
-
 @mcp.tool()
 async def search_web(query: str) -> str:
     """
-    Execute a web search through SearXNG with caching, deduplication, and result filtering.
+    [FAST] Execute a web search through SearXNG (Jarvis).
+    Best for quick lookups, facts, and API-friendly scraping.
+    """
+    corr_id = uuid.uuid4().hex
+    logger.info("search_web called", extra={"query": query, "corr_id": corr_id})
 
-    This tool is designed to be called by LLM agents or external services via the MCP protocol.
-    It uses an internal async search engine (jarvis_search_v2) backed by a local SearXNG instance.
+    config = SearchConfig(base_url="http://localhost:8080", max_concurrent=3, max_retries=2)
+
+    try:
+        results = await smart_search([query], max_sources=10, config=config)
+    except Exception as exc:
+        logger.exception("smart_search failed", extra={"corr_id": corr_id})
+        return f"❌ SearXNG Error. ID: {corr_id}"
+
+    if not results:
+        return "Поиск SearXNG не дал результатов."
+
+    output_lines = []
+    for result in results:
+        output_lines.append(
+            f"Title: {result.get('title')}\nURL: {result.get('url')}\nSnippet: {result.get('content')}\n---"
+        )
+    return "\n".join(output_lines)
+
+
+@mcp.tool()
+async def search_yandex_selenium(query: str ) -> str:
+    """
+    [SLOW/DEEP] Execute a real browser search via Yandex using Selenium.
+
+    Use this tool ONLY when:
+    1. 'search_web' (SearXNG) failed or returned irrelevant results.
+    2. You need specific Yandex RU results that other engines miss.
+    3. The target site requires a real browser fingerprint.
+
+    WARNING: This is slower (5-10s) than search_web.
 
     Parameters
     ----------
     query : str
-        The natural language search query. Must not be empty.
-        Example: "latest AI breakthroughs 2025"
-
-    Returns
-    -------
-    str
-        A formatted, human-readable string of up to 10 results.
-        Each result includes title, URL, and snippet.
-        If no results or an error occurs, returns a user-friendly error message with correlation ID.
-
-    Raises
-    ------
-    Exception
-        Any underlying exception from smart_search is caught and wrapped in a user-safe response.
+        Search query.
     """
-
-    # Generate unique correlation ID for tracing across logs and systems
     corr_id = uuid.uuid4().hex
-
-    logger.info("search_web called", extra={"query": query, "corr_id": corr_id})
-
-    config = SearchConfig(
-        base_url="http://localhost:8080",
-        max_concurrent=3,
-        max_retries=2,
-    )
+    logger.info("search_yandex_selenium called", extra={"query": query, "headless": False, "corr_id": corr_id})
 
     try:
-        # smart_search expects a list of queries
-        results = await smart_search([query], max_sources=10, config=config)
+        # Selenium is blocking, so we run it in a separate thread to keep MCP responsive
+        # We also protect stdout so the driver doesn't break the MCP pipe
+
+        def safe_selenium_execution():
+            with protect_stdout():
+                # get_links_from_yandex ожидает список запросов
+                return get_links_from_yandex([query], headless=False, limit=5, global_unique=False)
+
+        # Выполняем в потоке
+        results_dict = await asyncio.to_thread(safe_selenium_execution)
+
+        # Результат приходит в виде {"query": ["url1", "url2"]}
+        urls = results_dict.get(query, [])
+
     except Exception as exc:
         logger.exception(
-            "smart_search failed during execution",
+            "Selenium search failed",
             extra={"query": query, "corr_id": corr_id},
         )
-        return (
-            f"❌ Ошибка при поиске. Попробуйте позже.\n"
-            f"[ID: {corr_id}]"
-        )
+        return f"❌ Ошибка Yandex Selenium. См. логи. [ID: {corr_id}]"
 
-    if not results:
-        logger.warning("No search results found", extra={"query": query, "corr_id": corr_id})
-        return "Поиск не дал результатов."
+    if not urls:
+        logger.warning("No Yandex results found", extra={"query": query, "corr_id": corr_id})
+        return "Yandex поиск не дал результатов (возможно, капча или пустая выдача)."
 
-    # Build human-readable output
-    output_lines = []
-    for result in results:
-        title = result.get("title", "[Без названия]")
-        url = result.get("url", "[Без URL]")
-        snippet = result.get("content", "[Нет сниппета]")
+    # Форматирование вывода
+    output_lines = [f"Found {len(urls)} links via Yandex for: '{query}'\n"]
+    for i, url in enumerate(urls, 1):
+        output_lines.append(f"{i}. {url}")
 
-        # Sanitize newlines in snippets to avoid breaking output format
-        snippet = snippet.replace('\n', ' ').replace('\r', ' ')
-        output_lines.append(
-            f"Title: {title}\n"
-            f"URL: {url}\n"
-            f"Snippet: {snippet}\n"
-            f"---"
-        )
+    # Подсказка для LLM
+    output_lines.append("\n(Note: These are direct URLs. Use 'fetch_url' or similar tool to read their content if needed.)")
 
     logger.debug(
-        "search_web completed successfully",
-        extra={"result_count": len(results), "corr_id": corr_id},
+        "search_yandex_selenium completed",
+        extra={"url_count": len(urls), "corr_id": corr_id},
     )
     return "\n".join(output_lines)
 
 
 # --------------------------------------------------------------------------- #
-# Entrypoint — Start the MCP Server
+# Entrypoint
 # --------------------------------------------------------------------------- #
 
 if __name__ == "__main__":
     try:
-        logger.info("Starting FastMCP server 'JarvisSearch'")
+        # ВАЖНО: убеждаемся, что логи идут в stderr перед запуском
+        # FastMCP использует stdout для общения с клиентом (Claude/LM Studio)
+        logger.info("Starting FastMCP server 'JarvisSearch' with Yandex Support")
         mcp.run()
     except KeyboardInterrupt:
-        logger.info("Server stopped by user (Ctrl+C)")
+        logger.info("Server stopped by user")
     except Exception as exc:
-        logger.critical("Unhandled exception in server loop", exc_info=True)
+        logger.critical("Unhandled exception", exc_info=True)
         sys.exit(1)
