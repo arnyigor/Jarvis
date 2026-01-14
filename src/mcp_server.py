@@ -197,7 +197,7 @@ def _safe_exec(code: str) -> Dict[str, Any]:
     """
     # -------------------------------------------------------------
     # Разрешённые модули
-    ALLOWED_MODULES = {"math","threading", "requests", "json", "urllib.parse", "urllib.request", "datetime", "time", "os", "sys", "re", "collections", "typing", "io", "uuid", "base64", "hashlib", "random", "string", "csv", "xml.etree.ElementTree", "html", "unicodedata", "functools", "itertools", "operator", "ast"}
+    ALLOWED_MODULES = {"math","threading","mpmath", "requests", "json", "urllib.parse", "urllib.request", "datetime", "time", "os", "sys", "re", "collections", "typing", "io", "uuid", "base64", "hashlib", "random", "string", "csv", "xml.etree.ElementTree", "html", "unicodedata", "functools", "itertools", "operator", "ast"}
     # расширяйте при необходимости
 
     def _safe_import(name: str, globals=None, locals=None,
