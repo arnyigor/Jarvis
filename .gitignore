@@ -364,3 +364,4 @@ cython_debug/
 /models_cache/models--intfloat--multilingual-e5-small/snapshots/c007d7ef6fd86656326059b28395a7a03a7c5846/tokenizer_config.json
 /src/data/chroma/chroma.sqlite3
 /src/search_results.json
+/src/cache/13bc78bda7e99527c46a1c8300e34777a1efef4e.json

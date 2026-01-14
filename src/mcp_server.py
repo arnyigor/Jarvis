@@ -11,16 +11,18 @@ and correlation IDs for distributed tracing.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import io
+import logging
 import os
 import sys
 import uuid
-import logging
-import asyncio
-import contextlib
+from contextlib import redirect_stdout, redirect_stderr
 from datetime import datetime
 from logging import DEBUG
 from logging.handlers import RotatingFileHandler
-from typing import Any, Dict, List
+from typing import Dict, Any, List
 
 # --------------------------------------------------------------------------- #
 # Logging Configuration — Cross-Platform ISO 8601 with Microsecond Precision
@@ -28,12 +30,14 @@ from typing import Any, Dict, List
 
 LOG_LEVEL = os.getenv("MCP_LOG_LEVEL", "DEBUG").upper()
 
+
 class ISO8601Formatter(logging.Formatter):
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
         ct = datetime.fromtimestamp(record.created)
         if datefmt:
             return ct.strftime(datefmt)
         return ct.isoformat(timespec='microseconds') + 'Z'
+
 
 MSG_FMT = "%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s"
 formatter = ISO8601Formatter(fmt=MSG_FMT)
@@ -48,7 +52,7 @@ file_handler = RotatingFileHandler(
 )
 file_handler.setFormatter(formatter)
 
-console_handler = logging.StreamHandler(sys.stderr) # ВАЖНО: Логи только в stderr, stdout занят MCP
+console_handler = logging.StreamHandler(sys.stderr)  # ВАЖНО: Логи только в stderr, stdout занят MCP
 console_handler.setFormatter(formatter)
 
 root_logger = logging.getLogger()
@@ -85,6 +89,7 @@ try:
 except ImportError:
     logger.warning("yandex_search module not found. 'search_yandex_selenium' tool will fail if called.")
 
+
 # --------------------------------------------------------------------------- #
 # Helper: Redirect Stdout Protection
 # --------------------------------------------------------------------------- #
@@ -103,42 +108,16 @@ def protect_stdout():
     finally:
         sys.stdout = original_stdout
 
+
 # --------------------------------------------------------------------------- #
 # Tool Definition
 # --------------------------------------------------------------------------- #
 
 mcp = FastMCP("JarvisSearch")
 
-@mcp.tool()
-async def search_web(query: str) -> str:
-    """
-    [FAST] Execute a web search through SearXNG (Jarvis).
-    Best for quick lookups, facts, and API-friendly scraping.
-    """
-    corr_id = uuid.uuid4().hex
-    logger.info("search_web called", extra={"query": query, "corr_id": corr_id})
-
-    config = SearchConfig(base_url="http://localhost:8080", max_concurrent=3, max_retries=2)
-
-    try:
-        results = await smart_search([query], max_sources=10, config=config)
-    except Exception as exc:
-        logger.exception("smart_search failed", extra={"corr_id": corr_id})
-        return f"❌ SearXNG Error. ID: {corr_id}"
-
-    if not results:
-        return "Поиск SearXNG не дал результатов."
-
-    output_lines = []
-    for result in results:
-        output_lines.append(
-            f"Title: {result.get('title')}\nURL: {result.get('url')}\nSnippet: {result.get('content')}\n---"
-        )
-    return "\n".join(output_lines)
-
 
 @mcp.tool()
-async def search_yandex_selenium(query: str ) -> str:
+async def search_yandex_selenium(query: str) -> str:
     """
     [SLOW/DEEP] Execute a real browser search via Yandex using Selenium.
 
@@ -189,13 +168,134 @@ async def search_yandex_selenium(query: str ) -> str:
         output_lines.append(f"{i}. {url}")
 
     # Подсказка для LLM
-    output_lines.append("\n(Note: These are direct URLs. Use 'fetch_url' or similar tool to read their content if needed.)")
+    output_lines.append(
+        "\n(Note: These are direct URLs. Use 'fetch_url' or similar tool to read their content if needed.)")
 
     logger.debug(
         "search_yandex_selenium completed",
         extra={"url_count": len(urls), "corr_id": corr_id},
     )
     return "\n".join(output_lines)
+
+
+# --------------------------------------------------------------------------- #
+# 3) execute_python_code – безопасный исполнитель
+# --------------------------------------------------------------------------- #
+
+import ast  # noqa: E402 – импорт после FastMCP, но до инструмента
+
+
+# ---------- 3.1  Сервис‑sandbox ----------
+def _safe_exec(code: str) -> Dict[str, Any]:
+    """
+    Выполняет `code` в изолированном окружении.
+    Возвращает словарь:
+        output – результат последнего выражения (если есть),
+        stdout – собранный вывод,
+        stderr – ошибки записи в stderr,
+        error  – сообщение об исключении (если возникло).
+    """
+    # -------------------------------------------------------------
+    # Разрешённые модули
+    ALLOWED_MODULES = {"math","threading", "requests", "json", "urllib.parse", "urllib.request", "datetime", "time", "os", "sys", "re", "collections", "typing", "io", "uuid", "base64", "hashlib", "random", "string", "csv", "xml.etree.ElementTree", "html", "unicodedata", "functools", "itertools", "operator", "ast"}
+    # расширяйте при необходимости
+
+    def _safe_import(name: str, globals=None, locals=None,
+                     fromlist=(), level=0):
+        if name not in ALLOWED_MODULES:
+            raise ImportError(f"Module {name!r} is not allowed")
+        return __import__(name, globals, locals, fromlist, level)
+
+    # -------------------------------------------------------------
+    sandbox = {
+        "__builtins__": {
+            "abs": abs,
+            "all": all,
+            "any": any,
+            "bool": bool,
+            "dict": dict,
+            "enumerate": enumerate,
+            "float": float,
+            "int": int,
+            "len": len,
+            "list": list,
+            "max": max,
+            "min": min,
+            "range": range,
+            "round": round,
+            "str": str,
+            "sum": sum,
+            "print": print,
+            "__import__": _safe_import,  # <-- ключевой пункт
+        }
+    }
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    try:
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            # Если код – однострочное выражение → сохраняем результат в _result_
+            parsed = ast.parse(code, mode="exec")
+            if len(parsed.body) == 1 and isinstance(parsed.body[0], ast.Expr):
+                exec_code = f"_result_ = {code}"
+            else:
+                exec_code = code
+
+            exec(exec_code, sandbox)
+
+        return {
+            "output": sandbox.get("_result_", None),
+            "stdout": stdout.getvalue().strip(),
+            "stderr": stderr.getvalue().strip(),
+            "error": None,
+        }
+
+    except Exception as exc:  # pragma: no cover
+        return {
+            "output": None,
+            "stdout": stdout.getvalue().strip(),
+            "stderr": stderr.getvalue().strip(),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+# ---------- 3.2  MCP‑инструмент ----------
+@mcp.tool()
+def execute_python_code(code: str) -> str:
+    """
+    Executes Python code in a secure sandbox.
+
+    IMPORTANT usage instructions for the AI model:
+    1. You MUST format your tool call arguments as a valid JSON object.
+    2. The JSON must have exactly one key: "code".
+    3. The value must be the Python script as a single string.
+
+    Example of correct usage:
+    {
+      "code": "import math\\nprint(math.sqrt(16))"
+    }
+
+    Do NOT output raw code. Do NOT usage XML tags inside the argument.
+    """
+    corr_id = uuid.uuid4().hex
+    logger.info("execute_python_code called",
+                extra={"corr_id": corr_id, "code_snippet": code[:120]})
+
+    res = _safe_exec(code)
+
+    parts: List[str] = []
+
+    if res["stdout"]:
+        parts.append(f"[stdout]\n{res['stdout']}")
+    if res["stderr"]:
+        parts.append(f"[stderr]\n{res['stderr']}")
+    if res["error"]:
+        parts.append(f"[error] {res['error']}")
+    if res["output"] is not None:
+        parts.append(f"[result] {res['output']}")
+
+    return "\n\n".join(parts) or "✅ Code executed – no output."
 
 
 # --------------------------------------------------------------------------- #
